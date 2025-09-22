@@ -5,11 +5,11 @@ API_KEY = "bce96c12393280a85a6bf1fa415433af"
 REGION = "us"  # us, uk, eu, au
 MARKET = "h2h"  # moneyline
 UNIT_SIZE = 1000  # bankroll
-TOP_N = 5  # top N arbs to display per sport
+TOP_N = 10  # top N arbs to display per sport
 ROUND_TO = 5  # round stakes to nearest 5
 
 # List of sports to scan
-SPORTS = ["baseball_mlb", "americanfootball_nfl"]
+SPORTS = ["baseball_mlb","americanfootball_ncaaf","americanfootball_nfl"]
 
 # ---------------------------
 # Step 0: Check remaining API credits
@@ -17,6 +17,18 @@ SPORTS = ["baseball_mlb", "americanfootball_nfl"]
 status_url = "https://api.the-odds-api.com/v4/sports/"
 status_params = {"apiKey": API_KEY}
 status_response = requests.get(status_url, params=status_params)
+
+from datetime import datetime
+import pytz
+
+def format_game_time(iso_time_str):
+    # Parse the UTC time
+    utc_time = datetime.fromisoformat(iso_time_str.replace("Z", "+00:00"))
+    # Convert to Eastern Time
+    eastern = pytz.timezone("US/Eastern")
+    local_time = utc_time.astimezone(eastern)
+    # Format like "Sep 18, 2025 @ 07:16 PM"
+    return local_time.strftime("%b %d, %Y @ %I:%M %p")
 
 if status_response.status_code != 200:
     print("❌ Error checking API status:", status_response.json())
@@ -136,6 +148,12 @@ for (sport, home, away, start), group in games:
             "profit": profit
         })
 
+from datetime import datetime
+
+# Helper to format American odds with a + sign
+def format_american(odds):
+    return f"+{odds}" if odds > 0 else str(odds)
+
 # ---------------------------
 # Step 5: Sort and print top N arbs per sport
 # ---------------------------
@@ -151,9 +169,14 @@ else:
 
         print(f"\n🎯 Top {TOP_N} Arbitrage Opportunities for {sport.upper()}:")
         for _, arb in sport_arbs.iterrows():
-            print(f"\n💰 {arb['away_team']} vs {arb['home_team']} (Starts: {arb['start_time']})")
-            print(f"   {arb['home_book']} → {arb['home_team']} @ {arb['home_odds']} (dec {american_to_decimal(arb['home_odds']):.2f})")
-            print(f"   {arb['away_book']} → {arb['away_team']} @ {arb['away_odds']} (dec {american_to_decimal(arb['away_odds']):.2f})")
+            # Format date
+            dt = datetime.fromisoformat(arb['start_time'].replace("Z", "+00:00"))
+            game_date = dt.strftime("%b %d, %Y @ %I:%M %p")
+
+            print(f"\n💰 {arb['away_team']} vs {arb['home_team']}")
+            print(f"   📅 Game Date: {game_date}")
+            print(f"   {arb['home_book']} → {arb['home_team']} @ {format_american(arb['home_odds'])}")
+            print(f"   {arb['away_book']} → {arb['away_team']} @ {format_american(arb['away_odds'])}")
             print(f"   ✅ Profit Margin: {arb['profit_margin']:.2f}%")
             print(f"   💵 Suggested Stakes: {arb['home_team']}: ${arb['stake_home']:.2f}, {arb['away_team']}: ${arb['stake_away']:.2f}")
             print(f"   💰 Guaranteed Profit: ${arb['profit']:.2f}")

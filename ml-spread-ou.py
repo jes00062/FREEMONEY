@@ -1,44 +1,92 @@
 import requests
 import pandas as pd
+from datetime import datetime
+import pytz
 
+# ---------- CONFIG ----------
 API_KEY = "bce96c12393280a85a6bf1fa415433af"
-REGION = "us"  # us, uk, eu, au
-UNIT_SIZE = 1000  # bankroll
-TOP_N = 5  # top N arbs to display per sport
-ROUND_TO = 5  # round stakes to nearest 5
+REGION = "us"
+UNIT_SIZE = 1000
+TOP_N = 5
+ROUND_TO = 5
 
-# Only MLB and NFL
-SPORTS = ["baseball_mlb", "americanfootball_nfl"]
+# Which sports to scan
+SPORTS = ["baseball_mlb", "americanfootball_nfl", "americanfootball_ncaaf"]
 
-# Valid markets per sport
+# Only these markets (no h2h)
 SPORT_MARKETS = {
-    "baseball_mlb": ["h2h", "spreads", "totals"],
-    "americanfootball_nfl": ["h2h", "spreads", "totals"]
+    "baseball_mlb": ["spreads", "totals"],
+    "americanfootball_nfl": ["spreads", "totals"],
+    "americanfootball_ncaaf": ["spreads", "totals"]
 }
 
+# Optional: whitelist bookmakers by key (set to None to allow all)
+ALLOWED_BOOK_KEYS = None
+# Example: ALLOWED_BOOK_KEYS = ["betmgm", "draftkings", "fanduel", "betrivers", "bovada"]
+
+REQUEST_TIMEOUT = 10  # seconds for API calls
+# ----------------------------
+
+def format_game_time(iso_time_str):
+    utc_time = datetime.fromisoformat(iso_time_str.replace("Z", "+00:00"))
+    eastern = pytz.timezone("US/Eastern")
+    local_time = utc_time.astimezone(eastern)
+    return local_time.strftime("%b %d, %Y @ %I:%M %p")
+
+def american_to_decimal(odds):
+    # odds expected as numeric (e.g., 150, -120)
+    if odds > 0:
+        return (odds / 100) + 1
+    else:
+        return (100 / abs(odds)) + 1
+
+def format_american(odds):
+    return f"+{int(odds)}" if odds > 0 else f"{int(odds)}"
+
+def calculate_stakes(unit, dec_a, dec_b, round_to=ROUND_TO):
+    # Initial unrounded stakes
+    stake_a = (unit / dec_a) / ((1/dec_a) + (1/dec_b))
+    stake_b = (unit / dec_b) / ((1/dec_a) + (1/dec_b))
+
+    # Round to nearest multiple of `round_to`
+    stake_a = round(stake_a / round_to) * round_to
+    stake_b = round(stake_b / round_to) * round_to
+
+    # ✅ Guaranteed payout should be the *minimum* of the two possible returns
+    payout_a = stake_a * dec_a
+    payout_b = stake_b * dec_b
+    guaranteed_payout = min(payout_a, payout_b)
+
+    total_stake = stake_a + stake_b
+    profit = guaranteed_payout - total_stake
+
+    return stake_a, stake_b, profit
+
 # ---------------------------
-# Step 0: Check remaining API credits
+# Step 0: Check API status / credits
 # ---------------------------
-status_url = "https://api.the-odds-api.com/v4/sports/"
-status_params = {"apiKey": API_KEY}
-status_response = requests.get(status_url, params=status_params)
+try:
+    status_response = requests.get("https://api.the-odds-api.com/v4/sports/", params={"apiKey": API_KEY}, timeout=REQUEST_TIMEOUT)
+except Exception as e:
+    print("❌ Error contacting Odds API (status check):", e)
+    raise SystemExit(1)
 
 if status_response.status_code != 200:
     print("❌ Error checking API status:", status_response.json())
+    raise SystemExit(1)
+
+remaining = status_response.headers.get("x-requests-remaining")
+if remaining:
+    print(f"✅ Remaining API credits: {remaining}")
 else:
-    remaining = status_response.headers.get("x-requests-remaining")
-    if remaining:
-        print(f"✅ Remaining API credits: {remaining}")
-    else:
-        print("⚠️ Could not detect remaining credits from API response headers.")
+    print("⚠️ Could not detect remaining credits from API response headers.")
 
 # ---------------------------
-# Step 1: Fetch odds for all sports
+# Step 1: Fetch odds for selected sports & markets (spreads, totals)
 # ---------------------------
-all_rows = []
-
+rows = []
 for sport in SPORTS:
-    markets = SPORT_MARKETS.get(sport, ["h2h"])
+    markets = SPORT_MARKETS.get(sport, ["spreads", "totals"])
     url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
     params = {
         "apiKey": API_KEY,
@@ -48,121 +96,160 @@ for sport in SPORTS:
         "dateFormat": "iso"
     }
 
-    response = requests.get(url, params=params)
-    if response.status_code != 200:
-        print(f"❌ Error fetching {sport} odds:", response.json())
+    print(f"Fetching {sport} ({', '.join(markets)}) ...")
+    try:
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        print(f"❌ Request error for {sport}:", e)
         continue
 
-    data = response.json()
+    if resp.status_code != 200:
+        print(f"❌ Error fetching {sport} odds:", resp.json())
+        continue
+
+    data = resp.json()
     if not data:
         print(f"⚠️ No games returned for {sport}")
         continue
 
     for game in data:
-        home_team = game["home_team"]
-        away_team = game["away_team"]
-        commence_time = game["commence_time"]
-
-        for book in game["bookmakers"]:
-            book_name = book["title"]
-            for market in book["markets"]:
-                market_type = market["key"]  # h2h, spreads, totals
-                for outcome in market["outcomes"]:
-                    all_rows.append({
+        home_team = game.get("home_team")
+        away_team = game.get("away_team")
+        commence_time = game.get("commence_time")
+        for book in game.get("bookmakers", []):
+            # optional book key filter
+            if ALLOWED_BOOK_KEYS is not None and book.get("key") not in ALLOWED_BOOK_KEYS:
+                continue
+            book_title = book.get("title")
+            book_key = book.get("key")
+            for market in book.get("markets", []):
+                mkey = market.get("key")
+                # we only appended spreads/totals (already requested), but double-check:
+                if mkey not in ("spreads", "totals"):
+                    continue
+                for outcome in market.get("outcomes", []):
+                    rows.append({
                         "sport": sport,
+                        "market": mkey,
                         "home_team": home_team,
                         "away_team": away_team,
                         "commence_time": commence_time,
-                        "bookmaker": book_name,
-                        "market": market_type,
-                        "team": outcome["name"],
-                        "line": outcome.get("point", None),  # Only for spreads/totals
-                        "odds": outcome["price"]
+                        "bookmaker": book_title,
+                        "book_key": book_key,
+                        "team": outcome.get("name"),        # team name or "Over"/"Under"
+                        "line": outcome.get("point"),      # numeric point for spread/total (may be None)
+                        "odds": outcome.get("price")       # American odds (may be numeric or string)
                     })
 
-df = pd.DataFrame(all_rows)
+df = pd.DataFrame(rows)
 if df.empty:
     print("⚠️ No odds data available after parsing. Check your API key or credits.")
-    exit()
-else:
-    print(f"✅ Parsed {len(df)} odds entries into the DataFrame.")
+    raise SystemExit(0)
+# cast numeric columns
+df["odds"] = pd.to_numeric(df["odds"], errors="coerce")
+df["line"] = pd.to_numeric(df["line"], errors="coerce")
+# absolute line for matching spreads/totals (None stays None)
+df["line_abs"] = df["line"].abs().round(3)
+
+print(f"✅ Parsed {len(df)} odds entries into the DataFrame.")
 
 # ---------------------------
-# Step 2: Convert American odds to decimal
+# Step 2: Find arbs (spreads & totals, separately)
 # ---------------------------
-def american_to_decimal(odds):
-    if odds > 0:
-        return (odds / 100) + 1
-    else:
-        return (100 / abs(odds)) + 1
-
-# ---------------------------
-# Step 3: Calculate stakes (rounded)
-# ---------------------------
-def calculate_stakes(unit, dec_home, dec_away, round_to=ROUND_TO):
-    stake_home = (unit / dec_home) / ((1/dec_home) + (1/dec_away))
-    stake_away = (unit / dec_away) / ((1/dec_home) + (1/dec_away))
-    
-    stake_home = round(stake_home / round_to) * round_to
-    stake_away = round(stake_away / round_to) * round_to
-    
-    guaranteed_payout = max(stake_home * dec_home, stake_away * dec_away)
-    profit = guaranteed_payout - (stake_home + stake_away)
-    return stake_home, stake_away, profit
-
-# ---------------------------
-# Step 4: Find arbitrage opportunities with line type
-# ---------------------------
-games = df.groupby(["sport", "home_team", "away_team", "commence_time"])
 arb_list = []
 
-for (sport, home, away, start), group in games:
-    # Check all outcomes for home and away teams
-    home_rows = group[group["team"] == home]
-    away_rows = group[group["team"] == away]
+for sport in SPORTS:
+    for market in ("spreads", "totals"):
+        sub = df[(df["sport"] == sport) & (df["market"] == market)]
+        if sub.empty:
+            continue
 
-    if home_rows.empty or away_rows.empty:
-        continue  # skip if missing odds for either team
+        # Group by line_abs, home, away, commence_time so we only compare identical lines
+        group_cols = ["sport", "market", "line_abs", "home_team", "away_team", "commence_time"]
+        groups = sub.groupby(group_cols, dropna=False)
 
-    # Pick best odds
-    best_home = home_rows.sort_values("odds", ascending=False).iloc[0]
-    best_away = away_rows.sort_values("odds", ascending=False).iloc[0]
+        for (s, m, line_abs, home, away, start), group in groups:
+            # ignore entries where line_abs is NaN -> we need numeric line for spreads/totals
+            if pd.isna(line_abs):
+                continue
 
-    # Convert to decimal
-    home_dec = american_to_decimal(best_home["odds"])
-    away_dec = american_to_decimal(best_away["odds"])
+            if m == "spreads":
+                # For spreads we expect team names as outcomes (home and away rows).
+                home_rows = group[group["team"] == home]
+                away_rows = group[group["team"] == away]
+                if home_rows.empty or away_rows.empty:
+                    continue
 
-    # Calculate arb %
-    arb_percent = (1/home_dec) + (1/away_dec)
+                best_home = home_rows.sort_values("odds", ascending=False).iloc[0]
+                best_away = away_rows.sort_values("odds", ascending=False).iloc[0]
 
-    if arb_percent < 1:
-        profit_margin = (1 - arb_percent) * 100
-        stake_home, stake_away, profit = calculate_stakes(UNIT_SIZE, home_dec, away_dec)
+                dec_home = american_to_decimal(best_home["odds"])
+                dec_away = american_to_decimal(best_away["odds"])
+                arb_percent = (1/dec_home) + (1/dec_away)
 
-        # Detect line type from market string if available
-        line_type = best_home.get("market", "ML")  # default to moneyline if missing
+                if arb_percent < 1:
+                    profit_margin = (1 - arb_percent) * 100
+                    stake_home, stake_away, profit = calculate_stakes(UNIT_SIZE, dec_home, dec_away)
+                    arb_list.append({
+                        "sport": sport,
+                        "market": "Spread",
+                        "line_value": line_abs,
+                        "home_team": home,
+                        "away_team": away,
+                        "start_time": start,
+                        "home_book": best_home["bookmaker"],
+                        "away_book": best_away["bookmaker"],
+                        "home_odds": int(best_home["odds"]),
+                        "away_odds": int(best_away["odds"]),
+                        "home_line": best_home["line"],
+                        "away_line": best_away["line"],
+                        "profit_margin": profit_margin,
+                        "stake_home": stake_home,
+                        "stake_away": stake_away,
+                        "profit": profit
+                    })
 
-        arb_list.append({
-            "sport": sport,
-            "home_team": home,
-            "away_team": away,
-            "start_time": start,
-            "home_book": best_home["bookmaker"],
-            "away_book": best_away["bookmaker"],
-            "home_odds": best_home["odds"],
-            "away_odds": best_away["odds"],
-            "line_type": line_type,
-            "profit_margin": profit_margin,
-            "stake_home": stake_home,
-            "stake_away": stake_away,
-            "profit": profit
-        })
+            elif m == "totals":
+                # For totals, outcomes are typically "Over" and "Under"
+                over_rows = group[group["team"].str.lower().str.contains("over", na=False)]
+                under_rows = group[group["team"].str.lower().str.contains("under", na=False)]
+                if over_rows.empty or under_rows.empty:
+                    continue
+
+                best_over = over_rows.sort_values("odds", ascending=False).iloc[0]
+                best_under = under_rows.sort_values("odds", ascending=False).iloc[0]
+
+                dec_over = american_to_decimal(best_over["odds"])
+                dec_under = american_to_decimal(best_under["odds"])
+                arb_percent = (1/dec_over) + (1/dec_under)
+
+                if arb_percent < 1:
+                    profit_margin = (1 - arb_percent) * 100
+                    stake_over, stake_under, profit = calculate_stakes(UNIT_SIZE, dec_over, dec_under)
+                    arb_list.append({
+                        "sport": sport,
+                        "market": "Total",
+                        "line_value": line_abs,
+                        "home_team": home,
+                        "away_team": away,
+                        "start_time": start,
+                        "over_book": best_over["bookmaker"],
+                        "under_book": best_under["bookmaker"],
+                        "over_odds": int(best_over["odds"]),
+                        "under_odds": int(best_under["odds"]),
+                        "over_line": best_over["line"],
+                        "under_line": best_under["line"],
+                        "profit_margin": profit_margin,
+                        "stake_over": stake_over,
+                        "stake_under": stake_under,
+                        "profit": profit
+                    })
 
 # ---------------------------
-# Step 5: Sort and print top N arbs per sport
+# Step 3: Print top arbs
 # ---------------------------
 if not arb_list:
-    print("⚠️ No arbitrage opportunities found at this time.")
+    print("⚠️ No arbitrage opportunities found for spreads/totals at this time.")
 else:
     arb_df = pd.DataFrame(arb_list)
     for sport in SPORTS:
@@ -173,10 +260,22 @@ else:
 
         print(f"\n🎯 Top {TOP_N} Arbitrage Opportunities for {sport.upper()}:")
         for _, arb in sport_arbs.iterrows():
-            print(f"\n💰 {arb['away_team']} vs {arb['home_team']} (Starts: {arb['start_time']})")
-            print(f"   Line Type: {arb['line_type']}")
-            print(f"   {arb['home_book']} → {arb['home_team']} @ {arb['home_odds']} (dec {american_to_decimal(arb['home_odds']):.2f})")
-            print(f"   {arb['away_book']} → {arb['away_team']} @ {arb['away_odds']} (dec {american_to_decimal(arb['away_odds']):.2f})")
-            print(f"   ✅ Profit Margin: {arb['profit_margin']:.2f}%")
-            print(f"   💵 Suggested Stakes: {arb['home_team']}: ${arb['stake_home']:.2f}, {arb['away_team']}: ${arb['stake_away']:.2f}")
-            print(f"   💰 Guaranteed Profit: ${arb['profit']:.2f}")
+            game_date = format_game_time(arb["start_time"])
+            if arb["market"] == "Spread":
+                print(f"\n💰 {arb['away_team']} vs {arb['home_team']}")
+                print(f"   📅 Game Date: {game_date}")
+                print(f"   📊 Market: Spread ({arb['line_value']})")
+                print(f"   {arb['home_book']} → {arb['home_team']} ({arb['home_line']:+}) @ {format_american(arb['home_odds'])} (dec {american_to_decimal(arb['home_odds']):.2f})")
+                print(f"   {arb['away_book']} → {arb['away_team']} ({arb['away_line']:+}) @ {format_american(arb['away_odds'])} (dec {american_to_decimal(arb['away_odds']):.2f})")
+                print(f"   ✅ Profit Margin: {arb['profit_margin']:.2f}%")
+                print(f"   💵 Suggested Stakes: {arb['home_team']}: ${arb['stake_home']:.2f}, {arb['away_team']}: ${arb['stake_away']:.2f}")
+                print(f"   💰 Guaranteed Profit: ${arb['profit']:.2f}")
+            else:  # Total
+                print(f"\n💰 {arb['away_team']} vs {arb['home_team']}")
+                print(f"   📅 Game Date: {game_date}")
+                print(f"   📊 Market: Total ({arb['line_value']})")
+                print(f"   {arb['over_book']} → Over ({arb['over_line']}) @ {format_american(arb['over_odds'])} (dec {american_to_decimal(arb['over_odds']):.2f})")
+                print(f"   {arb['under_book']} → Under ({arb['under_line']}) @ {format_american(arb['under_odds'])} (dec {american_to_decimal(arb['under_odds']):.2f})")
+                print(f"   ✅ Profit Margin: {arb['profit_margin']:.2f}%")
+                print(f"   💵 Suggested Stakes: Over: ${arb['stake_over']:.2f}, Under: ${arb['stake_under']:.2f}")
+                print(f"   💰 Guaranteed Profit: ${arb['profit']:.2f}")
