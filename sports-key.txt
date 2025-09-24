@@ -1,0 +1,7 @@
+
+
+
+"americanfootball_nfl", "americanfootball_ncaaf",
+"baseball_mlb","basketball_nba","basketball_nba_preseason"
+"basketball_ncaab","icehockey_nhl"
+

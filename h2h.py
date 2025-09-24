@@ -1,7 +1,7 @@
 import requests
 import pandas as pd
 
-API_KEY = "bce96c12393280a85a6bf1fa415433af"
+API_KEY = "f7aa230a8379043a6fee01e111290300"
 REGION = "us"  # us, uk, eu, au
 MARKET = "h2h"  # moneyline
 UNIT_SIZE = 1000  # bankroll
@@ -9,7 +9,7 @@ TOP_N = 10  # top N arbs to display per sport
 ROUND_TO = 5  # round stakes to nearest 5
 
 # List of sports to scan
-SPORTS = ["baseball_mlb","americanfootball_ncaaf","americanfootball_nfl"]
+SPORTS = ["baseball_mlb"]
 
 # ---------------------------
 # Step 0: Check remaining API credits
