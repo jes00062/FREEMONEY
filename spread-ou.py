@@ -8,15 +8,16 @@ import sys
 API_KEY = "f7aa230a8379043a6fee01e111290300"  # <-- Replace with your live key
 REGION = "us"
 UNIT_SIZE = 1000
-TOP_N = 5
+TOP_N = 10
 ROUND_TO = 5
 
-SPORTS = ["baseball_mlb"]
+SPORTS = ["baseball_mlb","americanfootball_nfl", "americanfootball_ncaaf"]
 
 SPORT_MARKETS = {
     "baseball_mlb": ["spreads", "totals"],
     "americanfootball_nfl": ["spreads", "totals"],
     "americanfootball_ncaaf": ["spreads", "totals"]
+    
 }
 
 ALLOWED_BOOK_KEYS = None  # None allows all bookmakers

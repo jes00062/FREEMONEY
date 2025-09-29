@@ -1,116 +1,165 @@
 import requests
-from datetime import datetime, timezone
+import pandas as pd
+from datetime import datetime
+import pytz
 
-# 🔑 Your Odds API Key
-API_KEY = "f7aa230a8379043a6fee01e111290300"
+# --------------------------- CONFIG ---------------------------
+API_KEY = "f7aa230a8379043a6fee01e111290300"  # Replace with your real API key
+REGION = "us"
+MARKET = "h2h"
+UNIT_SIZE = 1000  # bankroll
+TOP_N = 10  # top N arbs per sport
+ROUND_TO = 5  # round stakes to nearest 5
+SPORTS = ["baseball_mlb"]  # list of sports to scan
 
-# 🎯 Config
-SPORT = "americanfootball_nfl"
-ALLOWED_BOOK_KEYS = ["draftkings", "fanduel", "betmgm", "betrivers", "bovada"]
-PLAYER_PROP_MARKETS = [
-    "player_pass_yds",
-    "player_rush_yds",
-    "player_receptions",
-    "player_rush_tds",
-    "player_pass_tds",
-    "player_anytime_td"
-]
-
-# 🎲 Helper functions
-def decimal_to_american(decimal_odds):
-    if decimal_odds >= 2.0:
-        return f"+{int((decimal_odds - 1) * 100)}"
+# --------------------------- HELPERS ---------------------------
+def american_to_decimal(odds):
+    if odds > 0:
+        return (odds / 100) + 1
     else:
-        return f"-{int(100 / (decimal_odds - 1))}"
+        return (100 / abs(odds)) + 1
 
-def calculate_arbitrage(odds1, odds2):
-    inv_sum = (1 / odds1) + (1 / odds2)
-    if inv_sum < 1:
-        margin = (1 - inv_sum) * 100
-        stake1 = round((1 / odds1) / inv_sum * 1000, 2)
-        stake2 = round((1 / odds2) / inv_sum * 1000, 2)
-        profit = round((min(stake1 * odds1, stake2 * odds2) - 1000), 2)
-        return margin, stake1, stake2, profit
-    return None
+def calculate_stakes(unit, dec_home, dec_away, round_to=ROUND_TO):
+    stake_home = (unit / dec_home) / ((1/dec_home) + (1/dec_away))
+    stake_away = (unit / dec_away) / ((1/dec_home) + (1/dec_away))
+    
+    # Round to nearest multiple of round_to
+    stake_home = round(stake_home / round_to) * round_to
+    stake_away = round(stake_away / round_to) * round_to
+    
+    guaranteed_payout = max(stake_home * dec_home, stake_away * dec_away)
+    profit = guaranteed_payout - (stake_home + stake_away)
+    return stake_home, stake_away, profit
 
-def fetch_events():
-    url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/events/?apiKey={API_KEY}"
-    r = requests.get(url)
-    r.raise_for_status()
-    return r.json()
+def format_american(odds):
+    return f"+{odds}" if odds > 0 else str(odds)
 
-def fetch_event_props(event_id):
-    url = (
-        f"https://api.the-odds-api.com/v4/sports/{SPORT}/events/{event_id}/odds"
-        f"?apiKey={API_KEY}&regions=us&markets={','.join(PLAYER_PROP_MARKETS)}"
-        f"&oddsFormat=decimal&bookmakers={','.join(ALLOWED_BOOK_KEYS)}"
-    )
-    r = requests.get(url)
-    r.raise_for_status()
-    return r.json()
+def format_game_time(iso_time_str):
+    utc_time = datetime.fromisoformat(iso_time_str.replace("Z", "+00:00"))
+    eastern = pytz.timezone("US/Eastern")
+    return utc_time.astimezone(eastern).strftime("%b %d, %Y @ %I:%M %p")
 
-# 🚀 Main logic
-def main():
-    print("✅ Starting player props arbitrage scan...\n")
+def extract_h2h_outcomes(bookmaker, home_team, away_team):
+    """
+    Pull only valid h2h market with both home/away teams present.
+    This avoids alt lines, inning props, etc.
+    """
+    for market in bookmaker.get("markets", []):
+        if market.get("key") == "h2h":
+            names = {o["name"] for o in market["outcomes"]}
+            if home_team in names and away_team in names:
+                return market["outcomes"]
+    return []
 
-    events = fetch_events()
-    print(f"Fetched {len(events)} {SPORT} events.\n")
+# --------------------------- FETCH & PARSE ODDS ---------------------------
+all_rows = []
 
-    for event in events:
-        home, away = event["home_team"], event["away_team"]
-        event_id = event["id"]
-        print(f"📅 {away} vs {home}")
+for sport in SPORTS:
+    url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+    params = {
+        "apiKey": API_KEY,
+        "regions": REGION,
+        "markets": MARKET,
+        "oddsFormat": "american",
+        "dateFormat": "iso"
+    }
+    
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        print(f"❌ Error fetching {sport} odds:", response.json())
+        continue
 
-        try:
-            data = fetch_event_props(event_id)
-        except Exception as e:
-            print(f"   ❌ Error fetching props: {e}")
+    data = response.json()
+    if not data:
+        print(f"⚠️ No games returned for {sport}")
+        continue
+
+    for game in data:
+        home_team = game["home_team"]
+        away_team = game["away_team"]
+        commence_time = game["commence_time"]
+
+        for book in game["bookmakers"]:
+            outcomes = extract_h2h_outcomes(book, home_team, away_team)
+            if not outcomes:
+                continue
+            for outcome in outcomes:
+                all_rows.append({
+                    "sport": sport,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "commence_time": commence_time,
+                    "bookmaker": book["title"],
+                    "team": outcome["name"],
+                    "odds": outcome["price"]
+                })
+
+df = pd.DataFrame(all_rows)
+if df.empty:
+    print("⚠️ No h2h odds data available after filtering.")
+    exit()
+else:
+    print(f"✅ Parsed {len(df)} clean h2h outcomes into the DataFrame.")
+
+# --------------------------- FIND ARBITRAGE ---------------------------
+games = df.groupby(["sport", "home_team", "away_team", "commence_time"])
+arb_list = []
+
+for (sport, home, away, start), group in games:
+    # pick best home and away odds across bookmakers
+    home_candidates = group[group["team"] == home]
+    away_candidates = group[group["team"] == away]
+    
+    if home_candidates.empty or away_candidates.empty:
+        continue  # skip if missing data
+    
+    best_home = home_candidates.sort_values("odds", ascending=False).iloc[0]
+    best_away = away_candidates.sort_values("odds", ascending=False).iloc[0]
+
+    home_dec = american_to_decimal(best_home["odds"])
+    away_dec = american_to_decimal(best_away["odds"])
+
+    arb_percent = (1/home_dec) + (1/away_dec)
+
+    if arb_percent < 1:
+        profit_margin = (1 - arb_percent) * 100
+        stake_home, stake_away, profit = calculate_stakes(UNIT_SIZE, home_dec, away_dec)
+
+        arb_list.append({
+            "sport": sport,
+            "home_team": home,
+            "away_team": away,
+            "start_time": start,
+            "home_book": best_home["bookmaker"],
+            "away_book": best_away["bookmaker"],
+            "home_odds": best_home["odds"],
+            "away_odds": best_away["odds"],
+            "profit_margin": profit_margin,
+            "stake_home": stake_home,
+            "stake_away": stake_away,
+            "profit": profit
+        })
+
+# --------------------------- PRINT TOP N ARBS ---------------------------
+if not arb_list:
+    print("⚠️ No arbitrage opportunities found at this time.")
+else:
+    arb_df = pd.DataFrame(arb_list)
+    for sport in SPORTS:
+        sport_arbs = arb_df[arb_df["sport"] == sport].sort_values("profit_margin", ascending=False).head(TOP_N)
+        if sport_arbs.empty:
+            print(f"\n⚠️ No arbitrage opportunities found for {sport}.")
             continue
 
-        bookmakers = data.get("bookmakers", [])
-        for market in data.get("markets", []):
-            market_key = market["key"]
-            outcomes_by_book = {}
+        print(f"\n🎯 Top {TOP_N} Arbitrage Opportunities for {sport.upper()}:")
+        for _, arb in sport_arbs.iterrows():
+            dt = datetime.fromisoformat(arb['start_time'].replace("Z", "+00:00"))
+            game_date = dt.strftime("%b %d, %Y @ %I:%M %p")
 
-            for book in bookmakers:
-                book_key = book["key"]
-                if book_key not in ALLOWED_BOOK_KEYS:
-                    continue
-                for bm_market in book["markets"]:
-                    if bm_market["key"] == market_key:
-                        for outcome in bm_market["outcomes"]:
-                            name = outcome["description"]
-                            price = outcome["price"]
-                            last_update = outcome.get("last_update")
-                            outcomes_by_book.setdefault(name, []).append(
-                                (book_key, price, last_update)
-                            )
-
-            for player, offers in outcomes_by_book.items():
-                if len(offers) < 2:
-                    continue
-                best = sorted(offers, key=lambda x: -x[1])[:2]
-                arb = calculate_arbitrage(best[0][1], best[1][1])
-                if arb:
-                    margin, stake1, stake2, profit = arb
-                    print(f"   🎯 {market_key} → {player}")
-                    for book_key, price, last_update in best:
-                        update_time = datetime.fromisoformat(
-                            last_update.replace("Z", "+00:00")
-                        ) if last_update else None
-                        freshness = (
-                            f"{(datetime.now(timezone.utc) - update_time).seconds//60}m old"
-                            if update_time else "unknown"
-                        )
-                        print(
-                            f"      {book_key} → {decimal_to_american(price)} "
-                            f"(dec {price:.2f}) | ⏱ {freshness}"
-                        )
-                    print(
-                        f"      ✅ Margin: {margin:.2f}% | "
-                        f"Suggested: {best[0][0]} ${stake1}, {best[1][0]} ${stake2} "
-                        f"| Profit: ${profit}\n"
-                    )
-
-if __name__ == "__main__":
-    main()
+            print(f"\n💰 {arb['away_team']} vs {arb['home_team']}")
+            print(f"   📅 Game Date: {game_date}")
+            print(f"   {arb['home_book']} → {arb['home_team']} @ {format_american(arb['home_odds'])}")
+            print(f"   {arb['away_book']} → {arb['away_team']} @ {format_american(arb['away_odds'])}")
+            print(f"   ✅ Profit Margin: {arb['profit_margin']:.2f}%")
+            print(f"   💵 Suggested Stakes: {arb['home_team']}: ${arb['stake_home']:.2f}, {arb['away_team']}: ${arb['stake_away']:.2f}")
+            print(f"   💰 Guaranteed Profit: ${arb['profit']:.2f}")

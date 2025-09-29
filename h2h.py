@@ -9,7 +9,7 @@ TOP_N = 10  # top N arbs to display per sport
 ROUND_TO = 5  # round stakes to nearest 5
 
 # List of sports to scan
-SPORTS = ["baseball_mlb"]
+SPORTS = ["baseball_mlb","americanfootball_nfl", "americanfootball_ncaaf"]
 
 # ---------------------------
 # Step 0: Check remaining API credits
